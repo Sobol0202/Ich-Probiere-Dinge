@@ -1,3 +1,17 @@
+let lastCallTs = 0; // best-effort throttle pro Function-Container
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function fetchJson(url, options) {
+  const res = await fetch(url, options);
+  const text = await res.text();
+  let body;
+  try { body = JSON.parse(text); } catch { body = { raw: text }; }
+  return { res, body };
+}
+
 exports.handler = async (event) => {
   const cors = {
     "Access-Control-Allow-Origin": "*",
@@ -5,15 +19,22 @@ exports.handler = async (event) => {
     "Access-Control-Allow-Methods": "POST, OPTIONS",
   };
 
-  if (event.httpMethod === "OPTIONS") {
-    return { statusCode: 204, headers: cors, body: "" };
-  }
-  if (event.httpMethod !== "POST") {
-    return { statusCode: 405, headers: cors, body: "Use POST" };
-  }
+  if (event.httpMethod === "OPTIONS") return { statusCode: 204, headers: cors, body: "" };
+  if (event.httpMethod !== "POST") return { statusCode: 405, headers: cors, body: "Use POST" };
 
-  const HOST = process.env.SHELLY_HOST;          // z.B. shelly-106-eu.shelly.cloud (OHNE :6022 /jrpc)
-  const AUTH_KEY = process.env.SHELLY_AUTH_KEY;  // aus Shelly App
+  // --- simple throttle: max 1 call / 800ms pro warm container ---
+  const now = Date.now();
+  if (now - lastCallTs < 800) {
+    return {
+      statusCode: 429,
+      headers: { ...cors, "Content-Type": "application/json" },
+      body: JSON.stringify({ ok: false, error: "Please wait a moment and try again." }),
+    };
+  }
+  lastCallTs = now;
+
+  const HOST = process.env.SHELLY_HOST;
+  const AUTH_KEY = process.env.SHELLY_AUTH_KEY;
   const DEVICE_ID = process.env.SHELLY_DEVICE_ID;
   const CHANNEL = Number(process.env.SHELLY_CHANNEL ?? "0");
 
@@ -21,58 +42,41 @@ exports.handler = async (event) => {
     return {
       statusCode: 500,
       headers: { ...cors, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        ok: false,
-        error: "Missing env vars",
-        need: ["SHELLY_HOST", "SHELLY_AUTH_KEY", "SHELLY_DEVICE_ID"],
-      }),
+      body: JSON.stringify({ ok: false, error: "Missing env vars" }),
     };
   }
 
   const apiBase = `https://${HOST}`;
 
-  // 0) Connectivity probe (nur um Host/DNS/TLS zu validieren)
+  // 1) GET status
+  let device;
   try {
-    await fetch(apiBase, { method: "GET" });
-  } catch (e) {
-    return {
-      statusCode: 502,
-      headers: { ...cors, "Content-Type": "application/json" },
-      body: JSON.stringify({ ok: false, step: "probe", apiBase, error: String(e) }),
-    };
-  }
-
-  // 1) Status holen
-  let deviceList;
-  try {
-    const getRes = await fetch(
+    const { res, body } = await fetchJson(
       `${apiBase}/v2/devices/api/get?auth_key=${encodeURIComponent(AUTH_KEY)}`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        // KEIN pick -> dann sollte "status" vollständig kommen (wenn verfügbar)
         body: JSON.stringify({ ids: [DEVICE_ID], select: ["status"] }),
       }
     );
 
-    const text = await getRes.text();
-    let json;
-    try { json = JSON.parse(text); } catch { json = { raw: text }; }
-
-    if (!getRes.ok) {
+    if (!res.ok) {
       return {
         statusCode: 502,
         headers: { ...cors, "Content-Type": "application/json" },
-        body: JSON.stringify({
-          ok: false,
-          step: "get_http",
-          status: getRes.status,
-          body: json,
-        }),
+        body: JSON.stringify({ ok: false, step: "get_http", status: res.status, body }),
       };
     }
 
-    deviceList = json;
+    if (!Array.isArray(body) || !body[0]) {
+      return {
+        statusCode: 500,
+        headers: { ...cors, "Content-Type": "application/json" },
+        body: JSON.stringify({ ok: false, error: "No device state returned", body }),
+      };
+    }
+
+    device = body[0];
   } catch (e) {
     return {
       statusCode: 502,
@@ -81,45 +85,7 @@ exports.handler = async (event) => {
     };
   }
 
-  // 2) Response validieren
-  if (!Array.isArray(deviceList) || deviceList.length === 0) {
-    return {
-      statusCode: 500,
-      headers: { ...cors, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        ok: false,
-        error: "No device state returned. DEVICE_ID falsch oder nicht in deinem Account?",
-        deviceList,
-      }),
-    };
-  }
-
-  const device = deviceList[0];
-
-  // hilfreich fürs Debugging
-  const online = device?.online;
-
-  if (!device?.status || typeof device.status !== "object") {
-    return {
-      statusCode: 500,
-      headers: { ...cors, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        ok: false,
-        error: "Device returned without status object (device offline oder API liefert keinen Status).",
-        online,
-        deviceMeta: {
-          id: device?.id,
-          gen: device?.gen,
-          type: device?.type,
-          code: device?.code,
-        },
-        // Wichtig: damit du siehst, was wirklich kommt
-        device,
-      }),
-    };
-  }
-
-  const status = device.status;
+  const status = device.status ?? {};
   const switchKey = `switch:${CHANNEL}`;
   const current = status?.[switchKey]?.output;
 
@@ -130,9 +96,7 @@ exports.handler = async (event) => {
       body: JSON.stringify({
         ok: false,
         error: `Cannot read status["${switchKey}"].output`,
-        online,
         statusKeys: Object.keys(status),
-        // hilft enorm: zeigt dir, ob es evtl. "switch:0" anders heißt
         switchObj: status?.[switchKey] ?? null,
       }),
     };
@@ -140,44 +104,61 @@ exports.handler = async (event) => {
 
   const nextOn = !current;
 
-  // 3) Schalten
-  try {
-    const setRes = await fetch(
-      `${apiBase}/v2/devices/api/set/switch?auth_key=${encodeURIComponent(AUTH_KEY)}`,
-      {
+  // 2) SET with retry on 429
+  const setUrl = `${apiBase}/v2/devices/api/set/switch?auth_key=${encodeURIComponent(AUTH_KEY)}`;
+  const payload = { id: DEVICE_ID, channel: CHANNEL, on: nextOn };
+
+  const maxAttempts = 4;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const { res, body } = await fetchJson(setUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: DEVICE_ID, channel: CHANNEL, on: nextOn }),
+        body: JSON.stringify(payload),
+      });
+
+      if (res.status === 429) {
+        // Backoff: 400ms, 800ms, 1600ms...
+        const wait = 400 * Math.pow(2, attempt - 1);
+        if (attempt === maxAttempts) {
+          return {
+            statusCode: 429,
+            headers: { ...cors, "Content-Type": "application/json" },
+            body: JSON.stringify({
+              ok: false,
+              step: "set_http",
+              status: 429,
+              error: "Rate limited by Shelly Cloud. Try again in a few seconds.",
+              body,
+            }),
+          };
+        }
+        await sleep(wait);
+        continue;
       }
-    );
 
-    const text = await setRes.text();
-    let json;
-    try { json = JSON.parse(text); } catch { json = { raw: text }; }
+      if (!res.ok) {
+        return {
+          statusCode: 502,
+          headers: { ...cors, "Content-Type": "application/json" },
+          body: JSON.stringify({ ok: false, step: "set_http", status: res.status, body }),
+        };
+      }
 
-    if (!setRes.ok) {
       return {
-        statusCode: 502,
+        statusCode: 200,
         headers: { ...cors, "Content-Type": "application/json" },
-        body: JSON.stringify({
-          ok: false,
-          step: "set_http",
-          status: setRes.status,
-          body: json,
-        }),
+        body: JSON.stringify({ ok: true, from: current, to: nextOn, result: body }),
       };
+    } catch (e) {
+      if (attempt === maxAttempts) {
+        return {
+          statusCode: 502,
+          headers: { ...cors, "Content-Type": "application/json" },
+          body: JSON.stringify({ ok: false, step: "set_fetch", error: String(e) }),
+        };
+      }
+      await sleep(300 * attempt);
     }
-
-    return {
-      statusCode: 200,
-      headers: { ...cors, "Content-Type": "application/json" },
-      body: JSON.stringify({ ok: true, from: current, to: nextOn, result: json }),
-    };
-  } catch (e) {
-    return {
-      statusCode: 502,
-      headers: { ...cors, "Content-Type": "application/json" },
-      body: JSON.stringify({ ok: false, step: "set_fetch", error: String(e) }),
-    };
   }
 };
