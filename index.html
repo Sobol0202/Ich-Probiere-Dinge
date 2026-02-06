@@ -2,24 +2,21 @@
 
 <script>
   document.getElementById("toggleBtn").addEventListener("click", async () => {
-    try {
-      const res = await fetch("/.netlify/functions/shelly-toggle", { method: "POST" });
-      const text = await res.text(); // erstmal roh lesen
-      let data;
-      try { data = JSON.parse(text); } catch { data = { raw: text }; }
+    const res = await fetch("/.netlify/functions/shelly-toggle", { method: "POST" });
+    const text = await res.text();
+    let data;
+    try { data = JSON.parse(text); } catch { data = { raw: text }; }
 
-      if (!res.ok || data.ok === false) {
-        console.error("Function error:", res.status, data);
-        alert("Fehler: " + (data.error || data.body || data.raw || res.statusText));
-        return;
-      }
+    console.log("STATUS:", res.status);
+    console.log("BODY:", data);
 
-      alert(`OK: ${data.from} → ${data.to}`);
-    } catch (e) {
-      console.error(e);
-      alert("Netzwerk/Browser-Fehler: " + e.message);
+    if (!res.ok || data.ok === false) {
+      alert("Fehler: " + (data.error || data.body || data.raw || res.statusText));
+      return;
     }
+    alert(`OK: ${data.from} → ${data.to}`);
   });
 </script>
+
 
 
